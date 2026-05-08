@@ -34,6 +34,7 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    computed_field,
     field_validator,
     model_validator,
 )
@@ -195,17 +196,42 @@ class InvestigationDecision(BaseModel):
 
 
 class DBMetadata(BaseModel):
+    """Характеристики БД, подаваемые в промпт LLM.
+
+    Метрики двоятся:
+    - n_metric_nodes — число узлов в иерархии (DISTINCT metric_id, всегда уникален).
+    - n_unique_metric_types — число различных метрик "по смыслу"
+      (DISTINCT COALESCE(metric_local_id, metric_name)).
+
+    metric_levels содержит per-level: nodes_at_level, unique_types,
+    avg_branching, min_branching, max_branching (последние три = 0 для листьев).
+    """
     n_objects: int
     n_employees: int
     has_me: bool
+
+    # Периоды
     n_periods: int
     periods_sample: List[str]
-    n_unique_metrics: int
+    period_min: Optional[str] = None
+    period_max: Optional[str] = None
+    period_distribution: Dict[str, int] = Field(default_factory=dict)
+
+    # Метрики
+    n_metric_nodes: int = 0
+    n_unique_metric_types: int = 0
     n_metric_rows: int
+
     metric_levels: Dict[str, Dict[str, float]]
     columns: Dict[str, str]
     column_descriptions: Dict[str, str]
     warnings: List[str] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def n_unique_metrics(self) -> int:
+        """Backward-compat alias для n_unique_metric_types."""
+        return self.n_unique_metric_types
 
 
 # ============================================================================
@@ -225,27 +251,53 @@ class _RetriesExhausted(Exception):
 
 def _format_metadata_summary(metadata: DBMetadata) -> str:
     lines = [
-        f"- Объектов всего: {metadata.n_objects} (руководитель: {metadata.has_me}, сотрудников: {metadata.n_employees})",
-        f"- Уникальных метрик (по metric_local_id): {metadata.n_unique_metrics}",
+        f"- Объектов всего: {metadata.n_objects} "
+        f"(руководитель: {metadata.has_me}, сотрудников: {metadata.n_employees})",
+        f"- Узлов в иерархии метрик: {metadata.n_metric_nodes} "
+        f"(типов уникальных: {metadata.n_unique_metric_types})",
         f"- Строк в таблице: {metadata.n_metric_rows}",
-        f"- Уникальных периодов: {metadata.n_periods}",
     ]
-    if metadata.periods_sample:
+
+    # Периоды
+    period_line = f"- Периодов: {metadata.n_periods}"
+    if metadata.period_min is not None and metadata.period_max is not None:
+        if metadata.period_min == metadata.period_max:
+            period_line += f" (единственный: {metadata.period_min})"
+        else:
+            period_line += (
+                f" (диапазон [{metadata.period_min} .. {metadata.period_max}], "
+                f"порядок сортировки лексикографический)"
+            )
+    lines.append(period_line)
+    if metadata.period_distribution:
+        dist = ", ".join(
+            f"{p}={n}" for p, n in metadata.period_distribution.items()
+        )
+        lines.append(f"- Распределение строк по периодам: {dist}")
+    elif metadata.periods_sample:
         lines.append(f"- Примеры периодов: {', '.join(metadata.periods_sample)}")
+
+    # Уровни
     if metadata.metric_levels:
         lines.append("- Распределение по уровням метрик:")
         for lvl in sorted(metadata.metric_levels.keys(), key=lambda x: int(x)):
             stats = metadata.metric_levels[lvl]
             parts = [f"уровень {lvl}"]
-            if "node_count" in stats:
-                parts.append(f"уник.метрик={int(stats['node_count'])}")
+            if "nodes_at_level" in stats:
+                parts.append(f"узлов={int(stats['nodes_at_level'])}")
+            if "unique_types" in stats:
+                parts.append(f"уник.типов={int(stats['unique_types'])}")
             if "avg_branching" in stats:
+                avg_b = stats["avg_branching"]
                 parts.append(
-                    f"ветвление avg={stats['avg_branching']:.2f} "
+                    f"ветвление avg={avg_b:.2f} "
                     f"min={int(stats.get('min_branching', 0))} "
                     f"max={int(stats.get('max_branching', 0))}"
                 )
+                if avg_b == 0 and stats.get("max_branching", 0) == 0:
+                    parts[-1] += " (листья)"
             lines.append(f"    {', '.join(parts)}")
+
     if metadata.warnings:
         lines.append(f"- Предупреждения: {'; '.join(metadata.warnings)}")
     return "\n".join(lines)
@@ -1223,6 +1275,8 @@ class MetricsAnalytics:
     def _compute_metadata(self) -> DBMetadata:
         assert self._conn is not None
         c = self._conn.cursor()
+
+        # ----- Объекты -----
         n_emp = c.execute(
             f"SELECT COUNT(DISTINCT object_id) FROM {TABLE_NAME} "
             f"WHERE object_role='employee'"
@@ -1232,6 +1286,7 @@ class MetricsAnalytics:
         ).fetchone()[0] == 1
         n_objects = n_emp + (1 if has_me else 0)
 
+        # ----- Периоды -----
         n_periods = c.execute(
             f"SELECT COUNT(DISTINCT period) FROM {TABLE_NAME} WHERE period IS NOT NULL"
         ).fetchone()[0]
@@ -1241,47 +1296,76 @@ class MetricsAnalytics:
                 f"WHERE period IS NOT NULL ORDER BY period LIMIT 10"
             ).fetchall()
         ]
+        period_min, period_max = c.execute(
+            f"SELECT MIN(period), MAX(period) FROM {TABLE_NAME} "
+            f"WHERE period IS NOT NULL"
+        ).fetchone()
+        period_distribution: Dict[str, int] = {
+            r[0]: int(r[1]) for r in c.execute(
+                f"SELECT period, COUNT(*) FROM {TABLE_NAME} "
+                f"WHERE period IS NOT NULL "
+                f"GROUP BY period ORDER BY COUNT(*) DESC, period LIMIT 20"
+            ).fetchall()
+        }
 
-        n_unique_metrics = c.execute(
-            f"SELECT COUNT(DISTINCT metric_local_id) FROM {TABLE_NAME} "
-            f"WHERE metric_local_id IS NOT NULL"
+        # ----- Метрики: общее число узлов и типов -----
+        n_metric_nodes = c.execute(
+            f"SELECT COUNT(DISTINCT metric_id) FROM {TABLE_NAME}"
+        ).fetchone()[0]
+        n_unique_metric_types = c.execute(
+            f"SELECT COUNT(DISTINCT COALESCE(metric_local_id, metric_name)) "
+            f"FROM {TABLE_NAME} "
+            f"WHERE COALESCE(metric_local_id, metric_name) IS NOT NULL"
         ).fetchone()[0]
         n_metric_rows = c.execute(
             f"SELECT COUNT(*) FROM {TABLE_NAME}"
         ).fetchone()[0]
 
+        # ----- Уровни -----
         levels: Dict[str, Dict[str, float]] = {}
-        for row in c.execute(
-            f"SELECT metric_level, COUNT(DISTINCT metric_local_id) "
-            f"FROM {TABLE_NAME} GROUP BY metric_level"
-        ).fetchall():
-            lvl, n = row[0], row[1]
-            levels.setdefault(str(lvl), {})["node_count"] = float(n)
 
+        # Узлы и типы per level (DISTINCT, чтобы не множить по периодам)
         for row in c.execute(f"""
-            WITH child_counts AS (
-                SELECT parent_metric_id,
-                       metric_level - 1 AS parent_level,
-                       COUNT(DISTINCT metric_local_id) AS k
+            WITH nodes AS (
+                SELECT DISTINCT metric_id, metric_level,
+                                metric_local_id, metric_name
                 FROM {TABLE_NAME}
-                WHERE parent_metric_id IS NOT NULL
-                GROUP BY parent_metric_id, parent_level
             )
-            SELECT parent_level, AVG(k), MIN(k), MAX(k), COUNT(*)
-            FROM child_counts GROUP BY parent_level
+            SELECT metric_level,
+                   COUNT(DISTINCT metric_id) AS n_nodes,
+                   COUNT(DISTINCT COALESCE(metric_local_id, metric_name)) AS n_types
+            FROM nodes GROUP BY metric_level
         """).fetchall():
-            parent_level, avg_k, min_k, max_k, n_parents = row
-            entry = levels.setdefault(str(parent_level), {})
+            lvl, n_nodes, n_types = row[0], row[1], row[2]
+            entry = levels.setdefault(str(lvl), {})
+            entry["nodes_at_level"] = float(n_nodes)
+            entry["unique_types"] = float(n_types)
+
+        # Ветвление per level: LEFT JOIN — листья учитываются с k=0
+        for row in c.execute(f"""
+            WITH nodes AS (
+                SELECT DISTINCT metric_id, metric_level FROM {TABLE_NAME}
+            ),
+            branching AS (
+                SELECT n.metric_id AS parent_id,
+                       n.metric_level AS lvl,
+                       COUNT(DISTINCT c.metric_id) AS k
+                FROM nodes n
+                LEFT JOIN {TABLE_NAME} c ON c.parent_metric_id = n.metric_id
+                GROUP BY n.metric_id, n.metric_level
+            )
+            SELECT lvl, AVG(k), MIN(k), MAX(k) FROM branching GROUP BY lvl
+        """).fetchall():
+            lvl, avg_k, min_k, max_k = row[0], row[1], row[2], row[3]
+            entry = levels.setdefault(str(lvl), {})
             entry["avg_branching"] = float(avg_k)
             entry["min_branching"] = float(min_k)
             entry["max_branching"] = float(max_k)
-            entry["parents_at_level"] = float(n_parents)
 
-        # Колонки и описания
+        # ----- Колонки и описания -----
         columns: Dict[str, str] = {}
         for r in c.execute(f"PRAGMA table_info({TABLE_NAME})").fetchall():
             columns[r["name"]] = r["type"]
-        # Описания: из self._column_comments (то что вошло в DDL)
         column_descriptions = dict(self._column_comments)
 
         return DBMetadata(
@@ -1290,7 +1374,11 @@ class MetricsAnalytics:
             has_me=has_me,
             n_periods=int(n_periods),
             periods_sample=periods_sample,
-            n_unique_metrics=int(n_unique_metrics),
+            period_min=period_min,
+            period_max=period_max,
+            period_distribution=period_distribution,
+            n_metric_nodes=int(n_metric_nodes),
+            n_unique_metric_types=int(n_unique_metric_types),
             n_metric_rows=int(n_metric_rows),
             metric_levels=levels,
             columns=columns,
