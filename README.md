@@ -47,16 +47,31 @@ result = agent.analyze(
 print(result["answer"])
 ```
 
+### Deep-режим: итеративное обследование БД
+
+```python
+result = agent.analyze(
+    query="Какие аномалии в данных?",
+    business_context="...",
+    response_format="bullet list",
+    deep=True,                  # многошаговый цикл
+    max_inspection_steps=7,     # опционально, override
+)
+```
+
+В `deep=True` вместо одного SQL-запроса агент делает **итеративный цикл**: на каждом шаге LLM решает — запустить ещё один `SELECT` (DISTINCT, COUNT, агрегации, выборки) или дать финальный ответ. Replan происходит естественно: каждый шаг LLM видит всю историю и пересматривает курс. В возврате — поле `investigation_steps` со всем трейсом исследования.
+
 ## Возвращаемая структура `analyze`
 
 ```python
 {
-    "answer":     str,    # финальный ответ от LLM
-    "sql":        str,    # сгенерированный SQL
-    "sql_result": list,   # результат выполнения
-    "reasoning":  str,    # рассуждения LLM (SQL + final)
-    "metadata":   dict,   # автоопределённые характеристики БД
-    "error":      dict,   # только при hard-fail (stage, type, message, retries)
+    "answer":              str,   # финальный ответ от LLM
+    "sql":                 str,   # последний выполненный SQL
+    "sql_result":          list,  # результат последнего SQL
+    "reasoning":           str,   # рассуждения LLM (склейка по шагам)
+    "metadata":            dict,  # автоопределённые характеристики БД
+    "investigation_steps": list,  # только в deep=True: трейс [{step_num, sql, result_full, ...}]
+    "error":               dict,  # только при hard-fail (stage, type, message, retries)
 }
 ```
 
@@ -83,7 +98,7 @@ pip install pytest
 python3 -m pytest tests/
 ```
 
-23 теста: schema/load, metadata, analyze со StubLLM (без реальных вызовов к модели).
+30 тестов: schema/load, metadata, analyze (simple + deep) со StubLLM (без реальных вызовов к модели).
 
 ## Файлы
 

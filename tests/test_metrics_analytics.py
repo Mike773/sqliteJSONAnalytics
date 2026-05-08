@@ -320,3 +320,170 @@ class TestAnalyze:
         result = agent.analyze("any", "ctx", "ok")
         assert "error" not in result
         assert result["answer"] == "ok"
+
+
+# =====================================================================
+# DEEP ANALYZE — итеративное обследование БД
+# =====================================================================
+
+class TestDeepAnalyze:
+    def test_single_step_immediate_answer(self):
+        # LLM сразу отвечает без исследования
+        ans = json.dumps({
+            "next_action": "answer",
+            "reasoning": "схема понятна, отвечаю сразу",
+            "answer": "5 строк в БД",
+        })
+        llm = StubLLM([ans])
+        agent = make_agent(get_llm=llm)
+        agent.json_to_sqlite(SAMPLE_MIN)
+        result = agent.analyze("сколько метрик?", "ctx", "число", deep=True)
+        assert "error" not in result
+        assert result["answer"] == "5 строк в БД"
+        assert result["investigation_steps"] == []
+
+    def test_multi_step_investigation(self):
+        # Шаг 1: explore (узнать периоды)
+        # Шаг 2: explore (узнать имена объектов)
+        # Шаг 3: answer
+        steps = [
+            json.dumps({
+                "next_action": "explore",
+                "reasoning": "проверю какие периоды есть",
+                "sql": "SELECT DISTINCT period FROM metrics",
+                "expected_insight": "набор уникальных периодов",
+            }),
+            json.dumps({
+                "next_action": "explore",
+                "reasoning": "теперь имена объектов",
+                "sql": "SELECT DISTINCT object_name FROM metrics WHERE object_role='employee'",
+                "expected_insight": "сколько сотрудников",
+            }),
+            json.dumps({
+                "next_action": "answer",
+                "reasoning": "достаточно: 1 период + 2 сотрудника",
+                "answer": "Q1 2024, сотрудники Alice и Bob",
+            }),
+        ]
+        llm = StubLLM(steps)
+        agent = make_agent(get_llm=llm)
+        agent.json_to_sqlite(SAMPLE_MIN)
+        result = agent.analyze("обзор", "ctx", "одна фраза", deep=True)
+        assert "error" not in result
+        assert result["answer"] == "Q1 2024, сотрудники Alice и Bob"
+        assert len(result["investigation_steps"]) == 2
+        assert result["investigation_steps"][0]["sql"].startswith("SELECT DISTINCT period")
+        assert result["investigation_steps"][1]["sql"].startswith("SELECT DISTINCT object_name")
+        # sql и sql_result должны указывать на последний выполненный шаг
+        assert "object_name" in result["sql"]
+        assert len(result["sql_result"]) >= 1
+
+    def test_replan_on_unexpected_data(self):
+        # LLM "обнаруживает" что-то и меняет курс на ходу
+        steps = [
+            json.dumps({
+                "next_action": "explore",
+                "reasoning": "сначала глобальное распределение",
+                "sql": "SELECT metric_name, COUNT(*) AS n FROM metrics GROUP BY metric_name",
+                "expected_insight": "какие метрики чаще встречаются",
+            }),
+            # После шага 1 LLM пересматривает план: углубляется в Deals
+            json.dumps({
+                "next_action": "explore",
+                "reasoning": "Deals встречается несколько раз — посмотрю детали",
+                "sql": "SELECT object_name, m_value FROM metrics WHERE metric_name='Deals' ORDER BY m_value DESC",
+                "expected_insight": "топ по сделкам",
+            }),
+            json.dumps({
+                "next_action": "answer",
+                "reasoning": "Alice — лидер",
+                "answer": "Alice (12 deals)",
+            }),
+        ]
+        llm = StubLLM(steps)
+        agent = make_agent(get_llm=llm)
+        agent.json_to_sqlite(SAMPLE_MIN)
+        result = agent.analyze("кто лидер", "ctx", "одна строка", deep=True)
+        assert "error" not in result
+        assert result["answer"] == "Alice (12 deals)"
+        # Replan виден в reasoning
+        assert "Deals встречается несколько раз" in result["reasoning"]
+
+    def test_invalid_explore_sql_retried(self):
+        # Первая попытка — explore с невалидным SQL (DROP), затем валидный
+        bad = json.dumps({
+            "next_action": "explore",
+            "reasoning": "ломаю",
+            "sql": "DROP TABLE metrics",
+            "expected_insight": "никаких",
+        })
+        good_explore = json.dumps({
+            "next_action": "explore",
+            "reasoning": "уже легально",
+            "sql": "SELECT COUNT(*) AS n FROM metrics",
+            "expected_insight": "общее число строк",
+        })
+        ans = json.dumps({
+            "next_action": "answer",
+            "reasoning": "понятно",
+            "answer": "5 строк",
+        })
+        llm = StubLLM([bad, good_explore, ans])
+        agent = make_agent(get_llm=llm)
+        agent.json_to_sqlite(SAMPLE_MIN)
+        result = agent.analyze("сколько", "ctx", "число", deep=True)
+        assert "error" not in result
+        assert result["answer"] == "5 строк"
+
+    def test_max_steps_force_finalize(self):
+        # Все шаги — explore. На последнем шаге force_finalize заставит дать answer.
+        # Если LLM упорно возвращает explore — должен быть error.
+        explore_step = json.dumps({
+            "next_action": "explore",
+            "reasoning": "ещё разок",
+            "sql": "SELECT 1 AS x FROM metrics LIMIT 1",
+            "expected_insight": "чекаем",
+        })
+        # 3 retries × N шагов = много explore-ответов; в итоге исчерпание ретраев
+        many = [explore_step] * 50
+        llm = StubLLM(many)
+        agent = make_agent(get_llm=llm, max_inspection_steps=3)
+        agent.json_to_sqlite(SAMPLE_MIN)
+        result = agent.analyze("упрись", "ctx", "ok", deep=True)
+        assert "error" in result
+        # на последнем шаге force_finalize заворачивает explore — fail в стадии deep_inspection
+        assert result["error"]["stage"] == "deep_inspection"
+
+    def test_max_inspection_steps_override_per_call(self):
+        ans = json.dumps({
+            "next_action": "answer",
+            "reasoning": "x",
+            "answer": "ok",
+        })
+        llm = StubLLM([ans])
+        agent = make_agent(get_llm=llm, max_inspection_steps=5)
+        agent.json_to_sqlite(SAMPLE_MIN)
+        # Per-call override на 2 шага
+        result = agent.analyze("q", "ctx", "ok", deep=True, max_inspection_steps=2)
+        assert "error" not in result
+        assert result["answer"] == "ok"
+
+    def test_pydantic_validation_explore_without_sql(self):
+        # LLM возвращает explore без sql — должно отфильтроваться pydantic-валидатором → retry
+        broken = json.dumps({
+            "next_action": "explore",
+            "reasoning": "забыл sql",
+            "sql": None,
+            "expected_insight": "ничего",
+        })
+        good = json.dumps({
+            "next_action": "answer",
+            "reasoning": "ладно",
+            "answer": "ok",
+        })
+        llm = StubLLM([broken, good])
+        agent = make_agent(get_llm=llm)
+        agent.json_to_sqlite(SAMPLE_MIN)
+        result = agent.analyze("q", "ctx", "ok", deep=True)
+        assert "error" not in result
+        assert result["answer"] == "ok"

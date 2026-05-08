@@ -24,7 +24,19 @@ import time
 import unicodedata
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Type, Union
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+try:
+    from typing import Literal
+except ImportError:  # pragma: no cover
+    from typing_extensions import Literal  # type: ignore
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 
 # ============================================================================
@@ -75,6 +87,8 @@ MAX_TEXT_LEN = 64 * 1024  # 64 KB
 MAX_COLUMN_NAME_LEN = 60
 MAX_DESCRIPTION_LEN = 200
 SQL_RESULT_PREVIEW_ROWS = 50
+INSPECTION_PREVIEW_ROWS = 20  # сколько строк результата каждого шага идёт обратно в LLM
+DEFAULT_MAX_INSPECTION_STEPS = 7
 
 
 # ============================================================================
@@ -137,6 +151,47 @@ class FinalAnswer(BaseModel):
     model_config = ConfigDict(extra='forbid')
     reasoning: str
     answer: str
+
+
+class InvestigationDecision(BaseModel):
+    """Решение LLM на каждом шаге deep-анализа: исследовать дальше или ответить."""
+    model_config = ConfigDict(extra='forbid')
+    next_action: Literal["explore", "answer"]
+    reasoning: str
+    sql: Optional[str] = None
+    expected_insight: Optional[str] = None
+    answer: Optional[str] = None
+
+    @field_validator('sql')
+    @classmethod
+    def validate_sql_if_present(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        s = v.strip()
+        while s.endswith(';'):
+            s = s[:-1].strip()
+        if not s:
+            raise ValueError("sql is empty")
+        head = s.split(None, 1)[0].upper()
+        if head not in ('SELECT', 'WITH'):
+            raise ValueError(
+                f"only SELECT/WITH read queries are allowed, got '{head}'"
+            )
+        if FORBIDDEN_SQL_KEYWORDS.search(s):
+            raise ValueError("DML/DDL keywords are forbidden")
+        if ';' in s:
+            raise ValueError("multiple statements (semicolons) are forbidden")
+        return s
+
+    @model_validator(mode='after')
+    def check_consistency(self) -> "InvestigationDecision":
+        if self.next_action == "explore":
+            if not self.sql:
+                raise ValueError("sql is required when next_action='explore'")
+        elif self.next_action == "answer":
+            if not self.answer:
+                raise ValueError("answer is required when next_action='answer'")
+        return self
 
 
 class DBMetadata(BaseModel):
@@ -290,6 +345,93 @@ def prompt_final_answer(
 """
 
 
+def _format_history_block(history: List[Dict[str, Any]]) -> str:
+    if not history:
+        return "(пусто — это первый шаг)"
+    parts = []
+    for step in history:
+        result_preview = step.get("result_preview", [])
+        truncated_note = (
+            f" (всего {step['result_total_rows']} строк, показаны первые {len(result_preview)})"
+            if step.get("result_total_rows", 0) > len(result_preview) else ""
+        )
+        parts.append(
+            f"=== Шаг {step['step_num'] + 1} ===\n"
+            f"Логика: {step['reasoning']}\n"
+            f"SQL: {step['sql']}\n"
+            f"Ожидался инсайт: {step.get('expected_insight', '')}\n"
+            f"Результат{truncated_note}:\n"
+            f"{json.dumps(result_preview, ensure_ascii=False, default=str, indent=2)}"
+        )
+    return "\n\n".join(parts)
+
+
+def prompt_inspection_step(
+    query: str,
+    business_context: str,
+    response_format: str,
+    metadata: DBMetadata,
+    table_ddl: str,
+    history: List[Dict[str, Any]],
+    step_num: int,
+    max_steps: int,
+    force_finalize: bool = False,
+) -> str:
+    finalize_instruction = ""
+    if force_finalize:
+        finalize_instruction = (
+            "ВНИМАНИЕ: лимит шагов исчерпан. Ты ОБЯЗАН вернуть next_action='answer' "
+            "с финальным ответом на основе уже собранной информации."
+        )
+    return f"""Ты — исследователь данных, работающий с одной in-memory таблицей SQLite по имени `{TABLE_NAME}`.
+
+ТВОЯ ЦЕЛЬ — ответить на вопрос пользователя через ПОШАГОВОЕ исследование БД.
+На каждом шаге ты решаешь: запустить ещё один SELECT (узнать что-то новое) или дать финальный ответ.
+
+ЖЁСТКИЕ ПРАВИЛА:
+1. Возвращай ТОЛЬКО валидный JSON-объект одного из двух типов:
+   а) Исследовать: {{"next_action": "explore", "reasoning": "...", "sql": "<SELECT>", "expected_insight": "..."}}
+   б) Ответить:    {{"next_action": "answer", "reasoning": "...", "answer": "<финальный ответ>"}}
+2. Поле `sql` — только SELECT или WITH, без DML/DDL, без ;, одно выражение.
+3. Никакого текста вне JSON.
+
+ВОПРОС ПОЛЬЗОВАТЕЛЯ:
+{query}
+
+БИЗНЕС-КОНТЕКСТ:
+{business_context}
+
+ТРЕБУЕМЫЙ ФОРМАТ ФИНАЛЬНОГО ОТВЕТА:
+{response_format}
+
+DDL ТАБЛИЦЫ (с комментариями):
+{table_ddl}
+
+ОПИСАНИЯ КОЛОНОК:
+{_format_columns_block(metadata)}
+
+ХАРАКТЕРИСТИКИ ДАННЫХ:
+{_format_metadata_summary(metadata)}
+
+ИСТОРИЯ ИССЛЕДОВАНИЯ:
+{_format_history_block(history)}
+
+ТЕКУЩИЙ ШАГ: {step_num + 1} из {max_steps}.
+{finalize_instruction}
+
+СОВЕТЫ ПО ИССЛЕДОВАНИЮ (если ещё мало знаешь о данных):
+- Уникальные значения ключевых полей: SELECT DISTINCT period FROM metrics; SELECT DISTINCT object_name FROM metrics WHERE object_role='employee';
+- Распределения: SELECT metric_name, COUNT(*) FROM metrics GROUP BY metric_name;
+- Аномалии/выбросы: ORDER BY m_value DESC LIMIT 10; PERCENTILE-функций нет, но MIN/MAX/AVG доступны.
+- Иерархия: WITH RECURSIVE для обхода parent_metric_id.
+
+Подумай: что бы дало мне максимальный инсайт ПРЯМО СЕЙЧАС, чтобы потом ответить пользователю?
+Если уже достаточно информации — отвечай. Если ещё нужно что-то узнать — исследуй.
+
+Возвращай только JSON.
+"""
+
+
 def prompt_with_feedback(base_prompt: str, errors: List[str]) -> str:
     error_block = "\n".join(f"- Попытка {i+1}: {e}" for i, e in enumerate(errors))
     return f"""Предыдущая(ие) попытка(и) провалилась:
@@ -323,12 +465,14 @@ class MetricsAnalytics:
         max_retries: int = DEFAULT_MAX_RETRIES,
         sql_timeout_sec: float = DEFAULT_SQL_TIMEOUT_SEC,
         row_limit: int = DEFAULT_ROW_LIMIT,
+        max_inspection_steps: int = DEFAULT_MAX_INSPECTION_STEPS,
     ) -> None:
         self._get_llm = get_llm
         self._descriptions = dict(field_descriptions or {})
         self._max_retries = max_retries
         self._sql_timeout = sql_timeout_sec
         self._row_limit = row_limit
+        self._max_inspection_steps = max_inspection_steps
 
         self._conn: Optional[sqlite3.Connection] = None
         # column_name → original_key (для доступа к описанию)
@@ -415,10 +559,19 @@ class MetricsAnalytics:
         query: str,
         business_context: str,
         response_format: str,
+        *,
+        deep: bool = False,
+        max_inspection_steps: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Полный пайплайн: discover metadata → LLM SQL (retry) → execute →
-        LLM final answer (retry) → return dict."""
-        partial = {
+        """Аналитика по вопросу пользователя.
+
+        deep=False (по умолчанию): один SQL → один ответ.
+        deep=True: итеративное обследование БД — на каждом шаге LLM решает,
+        нужен ещё SELECT или можно отвечать. Replan происходит естественно
+        (на каждом шаге LLM видит всю историю и переоценивает план).
+        В возврате дополнительно поле `investigation_steps` со всем трейсом.
+        """
+        partial: Dict[str, Any] = {
             "answer": "",
             "sql": "",
             "sql_result": [],
@@ -442,6 +595,13 @@ class MetricsAnalytics:
                 partial, "input_validation", type(e).__name__, str(e), retries=0
             )
 
+        if deep:
+            return self._deep_analyze(
+                query, business_context, response_format, metadata, partial,
+                max_steps=max_inspection_steps or self._max_inspection_steps,
+            )
+
+        # === Простой режим (как было) ===
         # 2) Генерация SQL
         try:
             sql_plan, sql_attempts = self._generate_sql(
@@ -480,6 +640,119 @@ class MetricsAnalytics:
             )
 
         return partial
+
+    # ------------------------------------------------------------------
+    # DEEP ANALYZE — итеративное обследование
+    # ------------------------------------------------------------------
+
+    def _deep_analyze(
+        self,
+        query: str,
+        business_context: str,
+        response_format: str,
+        metadata: DBMetadata,
+        partial: Dict[str, Any],
+        max_steps: int,
+    ) -> Dict[str, Any]:
+        """Итеративный цикл: на каждом шаге LLM выбирает explore/answer.
+        Replan происходит естественно — LLM видит всю историю и пересматривает курс."""
+        history: List[Dict[str, Any]] = []
+        partial["investigation_steps"] = history
+        reasoning_parts: List[str] = []
+        table_ddl = self.get_table_ddl()
+
+        for step_num in range(max_steps):
+            force_finalize = (step_num == max_steps - 1)
+            base_prompt = prompt_inspection_step(
+                query, business_context, response_format,
+                metadata, table_ddl, history, step_num, max_steps,
+                force_finalize=force_finalize,
+            )
+
+            def runtime_check(decision: InvestigationDecision) -> None:
+                # Если LLM хочет explore — проверим SQL через EXPLAIN
+                if decision.next_action == "explore" and decision.sql:
+                    try:
+                        self._conn.execute(f"EXPLAIN {decision.sql}").fetchall()
+                    except sqlite3.Error as e:
+                        cols = list(metadata.columns.keys())[:30]
+                        raise ValueError(
+                            f"SQL error from EXPLAIN: {e}. Available columns: {cols}"
+                        )
+                # При force_finalize отказываемся от explore
+                if force_finalize and decision.next_action != "answer":
+                    raise ValueError(
+                        "step limit reached, you must return next_action='answer'"
+                    )
+
+            try:
+                decision, errors = self._llm_json_call(
+                    base_prompt,
+                    InvestigationDecision,
+                    runtime_check,
+                    stage="deep_inspection",
+                )
+            except _RetriesExhausted as e:
+                partial["reasoning"] = "\n\n".join(reasoning_parts) or partial.get("reasoning", "")
+                return self._fail(
+                    partial, "deep_inspection", "RetriesExhausted",
+                    "; ".join(e.errors), retries=len(e.errors),
+                )
+
+            reasoning_parts.append(
+                f"[Шаг {step_num + 1} / {decision.next_action}] {decision.reasoning}"
+            )
+
+            if decision.next_action == "answer":
+                partial["answer"] = decision.answer or ""
+                partial["reasoning"] = "\n\n".join(reasoning_parts)
+                if history:
+                    last = history[-1]
+                    partial["sql"] = last["sql"]
+                    partial["sql_result"] = last.get("result_full", [])
+                return partial
+
+            # explore: выполняем SQL
+            try:
+                step_full_result = self._execute_sql(decision.sql or "")
+            except Exception as e:
+                # Записываем неудачный шаг в историю и продолжаем (LLM увидит ошибку)
+                history.append({
+                    "step_num": step_num,
+                    "reasoning": decision.reasoning,
+                    "sql": decision.sql or "",
+                    "expected_insight": decision.expected_insight or "",
+                    "result_preview": [],
+                    "result_full": [],
+                    "result_total_rows": 0,
+                    "error": str(e),
+                })
+                continue
+
+            # Превью для следующего промпта (ограничено INSPECTION_PREVIEW_ROWS)
+            preview = step_full_result[:INSPECTION_PREVIEW_ROWS]
+            history.append({
+                "step_num": step_num,
+                "reasoning": decision.reasoning,
+                "sql": decision.sql or "",
+                "expected_insight": decision.expected_insight or "",
+                "result_preview": preview,
+                "result_full": step_full_result,
+                "result_total_rows": len(step_full_result),
+            })
+
+        # Лимит шагов исчерпан и LLM не вернул answer (на последнем шаге force_finalize=True)
+        # должен был сработать, но на всякий случай:
+        partial["reasoning"] = "\n\n".join(reasoning_parts)
+        if history:
+            last = history[-1]
+            partial["sql"] = last["sql"]
+            partial["sql_result"] = last.get("result_full", [])
+        return self._fail(
+            partial, "deep_inspection", "MaxStepsExceeded",
+            f"исчерпан лимит {max_steps} шагов, финальный ответ не получен",
+            retries=max_steps,
+        )
 
     # ------------------------------------------------------------------
     # РЕИНИТ БД
