@@ -2,3 +2,5 @@ pydantic>=2.6,<3
 
 # dev
 pytest>=8.0,<9
+# опционально — нужен только для tests/test_e2e_openai.py
+openai>=1.0
