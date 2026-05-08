@@ -152,6 +152,78 @@ class TestSchemaLoading:
         with pytest.raises(ValueError):
             agent.json_to_sqlite({"me": "not_a_dict", "employees": []})
 
+    def test_metric_name_alias_no_duplicate(self):
+        """Если в JSON метрики поле называется `metric_name`, оно должно
+        идти в фиксированную колонку, а не создавать дубль `m_metric_name`."""
+        payload = {
+            "me": {},
+            "employees": [{
+                "id": "e1",
+                "name": "Bob",
+                "metrics": [{
+                    "id": "rev",
+                    "metric_name": "Revenue",
+                    "value": 100,
+                    "period": "2024",
+                }],
+            }],
+        }
+        agent = make_agent()
+        agent.json_to_sqlite(payload)
+        cols = {r["name"] for r in agent._conn.execute(
+            f"PRAGMA table_info({TABLE_NAME})"
+        ).fetchall()}
+        assert "m_metric_name" not in cols
+        rows = agent._conn.execute(
+            f"SELECT metric_name FROM {TABLE_NAME} WHERE metric_local_id='rev'"
+        ).fetchall()
+        assert rows[0][0] == "Revenue"
+
+    def test_object_name_id_aliases_no_duplicate(self):
+        """`object_name`/`object_id` в JSON объекта не создают дубли колонок."""
+        payload = {
+            "me": {},
+            "employees": [{
+                "object_id": "e1",
+                "object_name": "Carol",
+                "metrics": [{"id": "x", "name": "X", "value": 1, "period": "2024"}],
+            }],
+        }
+        agent = make_agent()
+        agent.json_to_sqlite(payload)
+        cols = {r["name"] for r in agent._conn.execute(
+            f"PRAGMA table_info({TABLE_NAME})"
+        ).fetchall()}
+        assert "obj_object_name" not in cols
+        assert "obj_object_id" not in cols
+        rows = agent._conn.execute(
+            f"SELECT object_name, object_id FROM {TABLE_NAME}"
+        ).fetchall()
+        assert rows[0][0] == "Carol"
+        assert rows[0][1] == "e1"
+
+    def test_explicit_alias_wins_over_short_form(self):
+        """Если есть и `name`, и `metric_name` — побеждает `metric_name`."""
+        payload = {
+            "me": {},
+            "employees": [{
+                "id": "e1",
+                "metrics": [{
+                    "id": "rev",
+                    "name": "short",
+                    "metric_name": "explicit",
+                    "value": 10,
+                    "period": "2024",
+                }],
+            }],
+        }
+        agent = make_agent()
+        agent.json_to_sqlite(payload)
+        rows = agent._conn.execute(
+            f"SELECT metric_name FROM {TABLE_NAME} WHERE metric_local_id='rev'"
+        ).fetchall()
+        assert rows[0][0] == "explicit"
+
     def test_ddl_contains_comments(self):
         agent = make_agent()
         agent.json_to_sqlite(SAMPLE_MIN)

@@ -788,8 +788,17 @@ class MetricsAnalytics:
     # ------------------------------------------------------------------
 
     # Ключи, которые всегда идут в фиксированные колонки (не дублировать как obj_*/m_*)
-    _OBJ_BUILTIN_KEYS = frozenset({"id", "name", "period", "metrics"})
-    _METRIC_BUILTIN_KEYS = frozenset({"id", "name", "period", "children"})
+    # Включают как короткие формы (id/name/period), так и явные алиасы под именами
+    # фиксированных колонок (object_id/object_name/metric_name и т.п.).
+    _OBJ_BUILTIN_KEYS = frozenset({
+        "id", "name", "period", "metrics",
+        "object_id", "object_name", "object_role",
+    })
+    _METRIC_BUILTIN_KEYS = frozenset({
+        "id", "name", "period", "children",
+        "metric_id", "metric_local_id", "metric_name",
+        "metric_level", "parent_metric_id",
+    })
 
     def _discover_schema(
         self, payload: InputPayload
@@ -1021,8 +1030,18 @@ class MetricsAnalytics:
         self, obj: InputObject, role: str
     ) -> Iterator[Dict[str, Any]]:
         obj_dump = obj.model_dump()
-        obj_id_str = str(obj_dump.get("id") or f"{role}_{id(obj)}")
-        obj_name = obj_dump.get("name")
+        # Алиасы: явная форма побеждает короткую (object_id > id, object_name > name)
+        obj_id_raw = (
+            obj_dump.get("object_id")
+            if obj_dump.get("object_id") is not None
+            else obj_dump.get("id")
+        )
+        obj_id_str = str(obj_id_raw) if obj_id_raw is not None else f"{role}_{id(obj)}"
+        obj_name = (
+            obj_dump.get("object_name")
+            if obj_dump.get("object_name") is not None
+            else obj_dump.get("name")
+        )
         object_period = obj_dump.get("period")
 
         # Поля объекта (всё кроме metrics)
@@ -1071,7 +1090,14 @@ class MetricsAnalytics:
         ancestor_period: Optional[str] = None,
     ) -> Iterator[Dict[str, Any]]:
         m_dump = metric.model_dump()
-        local_id_raw = m_dump.get("id")
+        # Алиасы: metric_local_id/metric_id > id; metric_name > name
+        local_id_raw = (
+            m_dump.get("metric_local_id")
+            if m_dump.get("metric_local_id") is not None
+            else m_dump.get("metric_id")
+            if m_dump.get("metric_id") is not None
+            else m_dump.get("id")
+        )
         local_id_str = str(local_id_raw) if local_id_raw is not None else f"_idx{sibling_idx}"
 
         if parent_path is None:
@@ -1079,7 +1105,11 @@ class MetricsAnalytics:
         else:
             path = f"{parent_path}/{local_id_str}"
 
-        metric_name = m_dump.get("name")
+        metric_name = (
+            m_dump.get("metric_name")
+            if m_dump.get("metric_name") is not None
+            else m_dump.get("name")
+        )
         direct_period = m_dump.get("period")
         # Резолвим период: метрика → предок → объект
         resolved_fallback = direct_period or ancestor_period or object_period
