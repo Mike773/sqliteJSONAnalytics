@@ -254,6 +254,12 @@ class TestMetadata:
         assert meta.n_objects == 3
         assert meta.n_periods == 1  # все Q1
         assert "2024-Q1" in meta.periods_sample
+        # 5 узлов: me/rev, e1/deals, e1/won, e1/lost, e2/deals
+        assert meta.n_metric_nodes == 5
+        # 4 типа: rev, deals, won, lost (deals у e1 и e2 — один тип)
+        assert meta.n_unique_metric_types == 4
+        # backward-compat alias
+        assert meta.n_unique_metrics == 4
 
     def test_metadata_levels_branching(self):
         agent = make_agent()
@@ -262,9 +268,11 @@ class TestMetadata:
         # 4 уровня: 0..3
         assert set(meta.metric_levels.keys()) >= {"0", "1", "2", "3"}
         # Уровень 0 — 1 узел (только L0)
-        assert meta.metric_levels["0"]["node_count"] == 1
+        assert meta.metric_levels["0"]["nodes_at_level"] == 1
         # Уровень 1 — 2 узла (L1A, L1B)
-        assert meta.metric_levels["1"]["node_count"] == 2
+        assert meta.metric_levels["1"]["nodes_at_level"] == 2
+        # Уровень 0 ветвится в 2 узла level=1
+        assert meta.metric_levels["0"]["avg_branching"] == 2.0
 
     def test_metadata_columns_included(self):
         agent = make_agent()
@@ -273,6 +281,57 @@ class TestMetadata:
         assert "object_role" in meta.columns
         assert "metric_id" in meta.columns
         assert "m_value" in meta.columns
+
+    def test_metadata_nodes_vs_types_diverge(self):
+        """Если один и тот же local_id у разных сотрудников — n_metric_nodes
+        больше, чем n_unique_metric_types."""
+        agent = make_agent()
+        agent.json_to_sqlite(SAMPLE_MIN)  # e1 и e2 оба имеют 'deals'
+        meta = agent._compute_metadata()
+        assert meta.n_metric_nodes > meta.n_unique_metric_types
+        assert meta.n_metric_nodes == 5
+        assert meta.n_unique_metric_types == 4
+
+    def test_metadata_branching_includes_leaves(self):
+        """Самый глубокий уровень (листья) должен попасть в metric_levels
+        с avg_branching=0, а не быть пропущенным."""
+        agent = make_agent()
+        agent.json_to_sqlite(SAMPLE_DEEP_TREE)
+        meta = agent._compute_metadata()
+        # уровень 3 — листья (LeafA, LeafB)
+        assert "3" in meta.metric_levels
+        leaf_stats = meta.metric_levels["3"]
+        assert leaf_stats["nodes_at_level"] == 2
+        assert leaf_stats["avg_branching"] == 0.0
+        assert leaf_stats["max_branching"] == 0.0
+
+    def test_metadata_period_distribution(self):
+        agent = make_agent()
+        agent.json_to_sqlite(SAMPLE_PERIOD_DICT)
+        meta = agent._compute_metadata()
+        assert meta.period_min == "2024-Q1"
+        assert meta.period_max == "2024-Q4"
+        assert set(meta.period_distribution.keys()) == {
+            "2024-Q1", "2024-Q2", "2024-Q3", "2024-Q4",
+        }
+        # На каждый период по одной строке (одна метрика × 4 периода)
+        assert all(v == 1 for v in meta.period_distribution.values())
+
+    def test_metadata_period_min_max_single(self):
+        agent = make_agent()
+        agent.json_to_sqlite(SAMPLE_OBJECT_PERIOD)  # только 2024-Q2
+        meta = agent._compute_metadata()
+        assert meta.period_min == "2024-Q2"
+        assert meta.period_max == "2024-Q2"
+        # В summary единственный период обозначен явно
+        summary = _format_metadata_summary_for_test(meta)
+        assert "единственный: 2024-Q2" in summary
+
+
+def _format_metadata_summary_for_test(meta):
+    """Импорт изнутри функции — чтобы не перенасыщать модульный импорт."""
+    from metrics_analytics import _format_metadata_summary
+    return _format_metadata_summary(meta)
 
 
 # =====================================================================
