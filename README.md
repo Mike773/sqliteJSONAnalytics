@@ -93,12 +93,24 @@ result = agent.analyze(
 
 ## Тесты
 
+### Unit-тесты (без сети, без денег)
+
 ```bash
 pip install pytest
 python3 -m pytest tests/
 ```
 
-30 тестов: schema/load, metadata, analyze (simple + deep) со StubLLM (без реальных вызовов к модели).
+30 тестов: schema/load, metadata, analyze (simple + deep) со StubLLM. Без реальных вызовов к модели.
+
+### E2E-тесты с реальным OpenAI (опционально)
+
+```bash
+pip install openai
+OPENAI_API_KEY=sk-... python3 -m pytest tests/test_e2e_openai.py -v -s
+# модель можно переопределить:  OPENAI_MODEL=gpt-4o ...
+```
+
+4 теста на реальном API: simple/deep × min/tree. По умолчанию `gpt-4o-mini`. Без `OPENAI_API_KEY` тесты автоматически пропускаются.
 
 ## Файлы
 
